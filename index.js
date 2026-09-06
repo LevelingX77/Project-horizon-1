@@ -1144,6 +1144,27 @@ async function registerCommands() {
 }
 
 // ============================================================================
+// HTTP SERVER — only needed if this is deployed as a Render "Web Service"
+// (a "Background Worker" doesn't need this at all). Render's free Web
+// Service requires the app to bind to process.env.PORT within its first
+// scan, otherwise the deploy is marked failed with "no open ports
+// detected". This also gives you a URL you can ping with an uptime
+// monitor to keep a free Web Service from spinning down.
+// ============================================================================
+
+const http = require('http');
+const PORT = process.env.PORT || 3000;
+
+http
+  .createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Shift bot is running.');
+  })
+  .listen(PORT, () => {
+    console.log(`[http] Listening on port ${PORT}`);
+  });
+
+// ============================================================================
 // START
 // ============================================================================
 
