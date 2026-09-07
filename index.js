@@ -1580,6 +1580,28 @@ async function registerCommands() {
 }
 
 // ============================================================================
+// HTTP SERVER — required because this is deployed as a Render "Web Service".
+// Render scans for an open port right after start; if nothing binds to
+// process.env.PORT within that window, it logs "No open ports detected"
+// and the deploy is never marked healthy (the process itself keeps running,
+// but Render won't route to it / may eventually restart it).
+// This also gives you a URL you can ping with an uptime monitor to keep a
+// free Web Service from spinning down after inactivity.
+// ============================================================================
+
+const http = require('http');
+const PORT = process.env.PORT || 3000;
+
+http
+  .createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('Shift bot is running.');
+  })
+  .listen(PORT, () => {
+    console.log(`[http] Listening on port ${PORT}`);
+  });
+
+// ============================================================================
 // START
 // ============================================================================
 
