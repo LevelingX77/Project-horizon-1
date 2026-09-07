@@ -28,6 +28,7 @@ const {
   TextInputBuilder,
   TextInputStyle,
   StringSelectMenuBuilder,
+  RoleSelectMenuBuilder,
 } = require('discord.js');
 const { MongoClient } = require('mongodb');
 
@@ -99,18 +100,28 @@ const IDS = {
   ABSENCE_SELECT: 'absence_select',
   ABSENCE_CONFIRM: 'absence_confirm',
   ABSENCE_CANCEL: 'absence_cancel',
+  OWNER_MARK_ABSENT_OPEN: 'owner_mark_absent_open',
+  OWNER_REVOKE_LEAVE_OPEN: 'owner_revoke_leave_open',
+  REVOKE_LEAVE_SELECT: 'revoke_leave_select',
+  REVOKE_LEAVE_CONFIRM: 'revoke_leave_confirm',
+  REVOKE_LEAVE_CANCEL: 'revoke_leave_cancel',
+  SET_ROLE_SELECT: 'set_role_select',
+  SET_ROLE_ADD: 'set_role_add',
+  SET_ROLE_REPLACE: 'set_role_replace',
+  SET_ROLE_CANCEL: 'set_role_cancel',
 };
 
 // ============================================================================
 // DATABASE — MongoDB via the official `mongodb` driver
 //
 // Collections:
-//   guildSettings  { _id: guildId, allowedRoleId, shiftChannelId, shiftMessageId,
-//                    leaveChannelId, leaveMessageId, dashboardChannelId, dashboardMessageId }
+//   guildSettings  { _id: guildId, allowedRoleIds: [], shiftChannelId, shiftMessageId,
+//                    leaveChannelId, leaveMessageId, dashboardChannelId, dashboardMessageId,
+//                    controlPanelChannelId, controlPanelMessageId }
 //   userStatus     { _id: `${guildId}:${userId}`, guildId, userId, status, shiftStart,
-//                    shiftEnd, totalShiftDuration, leaveDate, leaveReason }
-//   leaveRequests  { _id: <auto-incrementing number>, guildId, userId, date, reason,
-//                    status, createdAt }
+//                    shiftEnd, totalShiftDuration, leaveStart, leaveEnd, leaveReason }
+//   leaveRequests  { _id: <auto-incrementing number>, guildId, userId, leaveStart, leaveEnd,
+//                    reason, status, createdAt }
 //   counters       { _id: name, seq } — backs the auto-incrementing leaveRequests id,
 //                    since Mongo has no built-in AUTOINCREMENT like SQLite.
 //
@@ -206,11 +217,22 @@ async function setShiftEnd(guildId, userId, timestamp) {
   return duration;
 }
 
-async function setLeave(guildId, userId, leaveDate, leaveReason) {
+async function setLeave(guildId, userId, leaveStart, leaveEnd, leaveReason) {
   await ensureUserRow(guildId, userId);
   await userStatusCol.updateOne(
     { _id: userStatusId(guildId, userId) },
-    { $set: { status: STATUS.LEAVE, leaveDate, leaveReason } }
+    { $set: { status: STATUS.LEAVE, leaveStart, leaveEnd, leaveReason } }
+  );
+}
+
+// Resets a user out of the "leave" status — used both when the leave period
+// naturally expires (see sweepExpiredLeaves) and when หัวดิส manually revokes
+// a leave early via the /owner-setup control panel.
+async function clearLeave(guildId, userId) {
+  await ensureUserRow(guildId, userId);
+  await userStatusCol.updateOne(
+    { _id: userStatusId(guildId, userId) },
+    { $set: { status: STATUS.NONE, leaveStart: null, leaveEnd: null, leaveReason: null } }
   );
 }
 
@@ -220,6 +242,19 @@ async function setAbsent(guildId, userId) {
     { _id: userStatusId(guildId, userId) },
     { $set: { status: STATUS.ABSENT } }
   );
+}
+
+// Finds everyone in a guild whose leave period has ended but who is still
+// marked STATUS.LEAVE, and clears them back to STATUS.NONE so they can shift
+// in immediately without any admin action.
+async function sweepExpiredLeaves(guildId) {
+  const now = Date.now();
+  const expired = await userStatusCol
+    .find({ guildId, status: STATUS.LEAVE, leaveEnd: { $lte: now } })
+    .toArray();
+  for (const row of expired) {
+    await clearLeave(guildId, row.userId);
+  }
 }
 
 // ---- leaveRequests helpers ----
@@ -240,13 +275,14 @@ async function getNextRequestId() {
   return result.seq;
 }
 
-async function createRequest(guildId, userId, date, reason) {
+async function createRequest(guildId, userId, leaveStart, leaveEnd, reason) {
   const requestId = await getNextRequestId();
   await leaveRequestsCol.insertOne({
     _id: requestId,
     guildId,
     userId,
-    date,
+    leaveStart,
+    leaveEnd,
     reason,
     status: LEAVE_REQUEST_STATUS.PENDING,
     createdAt: Date.now(),
@@ -279,8 +315,9 @@ function isAdmin(member, guild) {
 async function hasAllowedRole(member, guild) {
   if (isAdmin(member, guild)) return true;
   const settings = await getSettings(guild.id);
-  if (!settings || !settings.allowedRoleId) return false;
-  return member.roles.cache.has(settings.allowedRoleId);
+  const roleIds = settings?.allowedRoleIds || [];
+  if (roleIds.length === 0) return false;
+  return roleIds.some((roleId) => member.roles.cache.has(roleId));
 }
 
 // ---- pendingSetups (in-memory drafts between /setup-* preview and Confirm/Cancel) ----
@@ -373,7 +410,54 @@ function buildLeaveButtonRow() {
 function formatTime(ts) {
   if (!ts) return '';
   const d = new Date(ts);
-  return d.toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' });
+  return d.toLocaleTimeString('th-TH', { timeZone: 'Asia/Bangkok', hour: '2-digit', minute: '2-digit' });
+}
+
+// ---- leave date/time parsing ----
+// Thailand is UTC+7. Inputs like "10/09/2027 12:00" are always interpreted
+// as Bangkok wall-clock time, regardless of the timezone the bot process
+// itself happens to run in (e.g. Render's servers run UTC).
+const BANGKOK_OFFSET_MS = 7 * 60 * 60 * 1000;
+
+function parseThaiDateTime(input) {
+  if (!input) return null;
+  const match = input.trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})$/);
+  if (!match) return null;
+
+  const [, ddStr, mmStr, yyyyStr, hhStr, minStr] = match;
+  const day = Number(ddStr);
+  const month = Number(mmStr);
+  const year = Number(yyyyStr);
+  const hour = Number(hhStr);
+  const minute = Number(minStr);
+
+  if (month < 1 || month > 12 || day < 1 || day > 31 || hour > 23 || minute > 59) return null;
+
+  // Reject dates that silently overflow (e.g. 31/02/2027 -> rolls over to
+  // March) instead of letting Date.UTC "fix" them into a different date.
+  const check = new Date(Date.UTC(year, month - 1, day));
+  if (
+    check.getUTCFullYear() !== year ||
+    check.getUTCMonth() !== month - 1 ||
+    check.getUTCDate() !== day
+  ) {
+    return null;
+  }
+
+  const utcMs = Date.UTC(year, month - 1, day, hour, minute) - BANGKOK_OFFSET_MS;
+  return Number.isNaN(utcMs) ? null : utcMs;
+}
+
+function formatThaiDateTime(ts) {
+  if (!ts) return '-';
+  return new Date(ts).toLocaleString('th-TH', {
+    timeZone: 'Asia/Bangkok',
+    day: '2-digit',
+    month: '2-digit',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
 }
 
 function buildDashboardEmbed(guild, roleMembers, statusRows) {
@@ -396,7 +480,7 @@ function buildDashboardEmbed(guild, roleMembers, statusRows) {
         off.push(`<@${member.id}> — ${formatTime(row.shiftEnd)}`);
         break;
       case STATUS.LEAVE:
-        onLeave.push(`<@${member.id}>`);
+        onLeave.push(`<@${member.id}> — ถึง ${formatThaiDateTime(row.leaveEnd)}`);
         break;
       case STATUS.ABSENT:
         absent.push(`<@${member.id}>`);
@@ -434,7 +518,8 @@ async function refreshDashboard(client, guildId) {
   const guild = client.guilds.cache.get(guildId);
   if (!guild) return;
 
-  if (!settings.allowedRoleId) return; // nothing to show yet
+  const roleIds = settings.allowedRoleIds || [];
+  if (roleIds.length === 0) return; // nothing to show yet
 
   let channel;
   try {
@@ -453,23 +538,31 @@ async function refreshDashboard(client, guildId) {
     return;
   }
 
-  let role;
-  try {
-    role = await guild.roles.fetch(settings.allowedRoleId);
-  } catch {
-    role = null;
-  }
-  if (!role) return;
-
-  // Make sure member cache is populated for the role's members.
-  let roleMembers;
+  // Make sure member cache is populated before reading any role's members.
   try {
     await guild.members.fetch();
-    roleMembers = role.members;
   } catch {
-    roleMembers = role.members; // fall back to whatever is cached
+    // fall back to whatever is cached
   }
 
+  // Union of members across every configured role — a member who holds more
+  // than one of the allowed roles is only shown once.
+  const roleMembers = new Map();
+  for (const roleId of roleIds) {
+    let role;
+    try {
+      role = await guild.roles.fetch(roleId);
+    } catch {
+      role = null;
+    }
+    if (!role) continue;
+    for (const [id, member] of role.members) {
+      roleMembers.set(id, member);
+    }
+  }
+  if (roleMembers.size === 0) return;
+
+  await sweepExpiredLeaves(guildId);
   const statusRows = await getAllForGuild(guildId);
   const embed = buildDashboardEmbed(guild, roleMembers, statusRows);
 
@@ -532,6 +625,74 @@ async function handleSetupCommand(interaction, type) {
   });
 }
 
+// ---- absence select flow (shared by the owner-setup control panel button) ----
+
+/**
+ * Builds the reply payload for the "ระบุคนขาดงาน" flow: everyone across all
+ * allowed roles who is neither currently working nor on leave. Returns a
+ * plain reply-options object — the caller decides how to send it.
+ */
+async function buildAbsenceSelectResponse(interaction) {
+  const settings = await getSettings(interaction.guildId);
+  const roleIds = settings.allowedRoleIds || [];
+  if (roleIds.length === 0) {
+    return { content: 'ยังไม่ได้ตั้งค่ายศระบบ กรุณาใช้ `/set-role` ก่อน', ephemeral: true };
+  }
+
+  await interaction.guild.members.fetch().catch(() => null);
+
+  const roleMembers = new Map();
+  for (const roleId of roleIds) {
+    const role = await interaction.guild.roles.fetch(roleId).catch(() => null);
+    if (!role) continue;
+    for (const [id, member] of role.members) {
+      roleMembers.set(id, member);
+    }
+  }
+
+  if (roleMembers.size === 0) {
+    return {
+      content: 'ไม่พบยศที่ตั้งค่าไว้ (อาจถูกลบไปแล้ว) กรุณาตั้งค่าใหม่ด้วย `/set-role`',
+      ephemeral: true,
+    };
+  }
+
+  await sweepExpiredLeaves(interaction.guildId);
+  const statusByUser = new Map(
+    (await getAllForGuild(interaction.guildId)).map((r) => [r.userId, r.status])
+  );
+
+  const eligible = [...roleMembers.values()].filter((member) => {
+    const status = statusByUser.get(member.id) || STATUS.NONE;
+    return status !== STATUS.WORKING && status !== STATUS.LEAVE;
+  });
+
+  if (eligible.length === 0) {
+    return {
+      content: 'ไม่มีสมาชิกที่ต้องระบุว่าขาดงาน ทุกคนเข้าเวรหมด',
+      ephemeral: true,
+    };
+  }
+
+  const options = eligible.slice(0, 25).map((member) => ({
+    label: member.displayName.slice(0, 100),
+    value: member.id,
+  }));
+
+  const select = new StringSelectMenuBuilder()
+    .setCustomId(IDS.ABSENCE_SELECT)
+    .setPlaceholder('เลือกสมาชิกที่ขาดงาน')
+    .setMinValues(1)
+    .setMaxValues(options.length)
+    .addOptions(options);
+
+  return {
+    content: 'เลือกสมาชิกที่ขาดงาน',
+    components: [new ActionRowBuilder().addComponents(select)],
+    ephemeral: true,
+  };
+}
+
 // ============================================================================
 // SLASH COMMANDS
 // ============================================================================
@@ -564,12 +725,12 @@ const commandDefs = [
   {
     data: new SlashCommandBuilder()
       .setName('setup-dashboard')
-      .setDescription('สร้าง/ตั้งค่า Dashboard แสดงสถานะการปฏิบัติงาน')
+      .setDescription('สร้าง Dashboard')
       .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
       .addChannelOption((opt) =>
         opt
           .setName('channel')
-          .setDescription('Channel ที่จะส่ง Dashboard (ค่าเริ่มต้น: channel นี้)')
+          .setDescription('Channel ที่จะส่ง Dashboard')
           .addChannelTypes(ChannelType.GuildText)
           .setRequired(false)
       ),
@@ -599,23 +760,31 @@ const commandDefs = [
   },
 
   {
+    // Discord hard-caps every select menu at 25 options and every slash
+    // command at 25 total options — so 25 roles in a single pick is the
+    // real ceiling, there's no way to make one action truly unlimited.
+    // To get past that, this command lets the admin choose "add" instead
+    // of "replace": run /set-role as many times as needed and each batch
+    // of up to 25 roles gets merged into the stored list, so the total
+    // number of allowed roles has no hard limit — only each pick does.
     data: new SlashCommandBuilder()
       .setName('set-role')
       .setDescription('กำหนดยศที่สามารถใช้ระบบเข้าเวร/ออกเวร/ลาได้')
-      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
-      .addRoleOption((opt) =>
-        opt.setName('role').setDescription('ยศที่ต้องการอนุญาต').setRequired(true)
-      ),
+      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
     async execute(interaction) {
       if (!isAdmin(interaction.member, interaction.guild)) {
         return interaction.reply({ content: 'แกไม่มีสิทธิ์ใช้งานคำสั่งนี้', ephemeral: true });
       }
 
-      const role = interaction.options.getRole('role', true);
-      await updateSettings(interaction.guildId, { allowedRoleId: role.id });
+      const select = new RoleSelectMenuBuilder()
+        .setCustomId(IDS.SET_ROLE_SELECT)
+        .setPlaceholder('เลือกยศที่ต้องการอนุญาต')
+        .setMinValues(1)
+        .setMaxValues(25);
 
       return interaction.reply({
-        content: `ตั้งค่ายศสำหรับระบบเป็น ${role} เรียบร้อยแล้ว`,
+        content: 'เลือกยศที่ต้องการอนุญาตให้ใช้ระบบเข้าเวร/ออกเวร/ลา',
+        components: [new ActionRowBuilder().addComponents(select)],
         ephemeral: true,
       });
     },
@@ -624,62 +793,54 @@ const commandDefs = [
   {
     data: new SlashCommandBuilder()
       .setName('owner-setup')
-      .setDescription('ระบุสมาชิกที่ขาดงาน')
-      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
+      .setDescription('สร้างแผงควบคุมสำหรับหัวดิส')
+      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator)
+      .addChannelOption((opt) =>
+        opt
+          .setName('channel')
+          .setDescription('Channel ที่จะส่งแผงควบคุม (ค่าเริ่มต้น: channel นี้)')
+          .addChannelTypes(ChannelType.GuildText)
+          .setRequired(false)
+      ),
     async execute(interaction) {
       if (!isAdmin(interaction.member, interaction.guild)) {
         return interaction.reply({ content: 'แกไม่มีสิทธิ์ใช้งานคำสั่งนี้', ephemeral: true });
       }
 
-      const settings = await getSettings(interaction.guildId);
-      if (!settings.allowedRoleId) {
-        return interaction.reply({
-          content: 'ยังไม่ได้ตั้งค่ายศระบบ กรุณาใช้ `/set-role` ก่อน',
-          ephemeral: true,
-        });
-      }
+      const channel = interaction.options.getChannel('channel') || interaction.channel;
 
-      const role = await interaction.guild.roles.fetch(settings.allowedRoleId).catch(() => null);
-      if (!role) {
-        return interaction.reply({
-          content: 'ไม่พบยศที่ตั้งค่าไว้ (อาจถูกลบไปแล้ว) กรุณาตั้งค่าใหม่ด้วย `/set-role`',
-          ephemeral: true,
-        });
-      }
+      const embed = new EmbedBuilder()
+        .setColor(DEFAULT_EMBED_COLOR)
+        .setTitle('แผงควบคุมของหัวดิส')
+        .setDescription(
+          'ปุ่มด้านล่างนี้ใช้ได้เฉพาะหัวดิสเท่านั้น\n\n' +
+            `${EMOJI.ABSENT} **ระบุคนขาดงาน** — เลือกสมาชิกที่ไม่ได้เข้าเวรและไม่ได้ลา แล้วบันทึกว่าขาดงาน\n` +
+            `${EMOJI.ON_LEAVE} **ถอนลา** — เลือกสมาชิกที่กำลังลาอยู่ เพื่อยกเลิกสถานะลาก่อนกำหนด`
+        )
+        .setTimestamp();
 
-      await interaction.guild.members.fetch().catch(() => null);
-
-      const statusByUser = new Map(
-        (await getAllForGuild(interaction.guildId)).map((r) => [r.userId, r.status])
+      const row = new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+          .setCustomId(IDS.OWNER_MARK_ABSENT_OPEN)
+          .setLabel('ระบุคนขาดงาน')
+          .setEmoji(EMOJI.ABSENT)
+          .setStyle(ButtonStyle.Danger),
+        new ButtonBuilder()
+          .setCustomId(IDS.OWNER_REVOKE_LEAVE_OPEN)
+          .setLabel('ถอนลา')
+          .setEmoji(EMOJI.ON_LEAVE)
+          .setStyle(ButtonStyle.Secondary)
       );
 
-      const eligible = role.members.filter((member) => {
-        const status = statusByUser.get(member.id) || STATUS.NONE;
-        return status !== STATUS.WORKING && status !== STATUS.LEAVE;
+      const message = await channel.send({ embeds: [embed], components: [row] });
+
+      await updateSettings(interaction.guildId, {
+        controlPanelChannelId: channel.id,
+        controlPanelMessageId: message.id,
       });
 
-      if (eligible.size === 0) {
-        return interaction.reply({
-          content: 'ไม่มีสมาชิกที่ต้องระบุว่าขาดงาน (ทุกคนเข้าเวรหรือลาแล้ว)',
-          ephemeral: true,
-        });
-      }
-
-      const options = [...eligible.values()].slice(0, 25).map((member) => ({
-        label: member.displayName.slice(0, 100),
-        value: member.id,
-      }));
-
-      const select = new StringSelectMenuBuilder()
-        .setCustomId(IDS.ABSENCE_SELECT)
-        .setPlaceholder('เลือกสมาชิกที่ขาดงาน')
-        .setMinValues(1)
-        .setMaxValues(options.length)
-        .addOptions(options);
-
       return interaction.reply({
-        content: 'เลือกสมาชิกที่ขาดงาน',
-        components: [new ActionRowBuilder().addComponents(select)],
+        content: `สร้างแผงควบคุมที่ ${channel} เรียบร้อยแล้ว`,
         ephemeral: true,
       });
     },
@@ -698,14 +859,22 @@ buttonHandlers.set(IDS.SHIFT_IN, {
       return interaction.reply({ content: 'คุณไม่มีสิทธิ์ใช้งานระบบนี้', ephemeral: true });
     }
 
-    const current = await getStatus(interaction.guildId, interaction.user.id);
+    let current = await getStatus(interaction.guildId, interaction.user.id);
+
+    // If their leave period has already ended, clear it right now instead of
+    // waiting for the periodic sweep — they should be able to shift in the
+    // moment the leave expires, not up to a minute later.
+    if (current.status === STATUS.LEAVE && current.leaveEnd && current.leaveEnd <= Date.now()) {
+      await clearLeave(interaction.guildId, interaction.user.id);
+      current = await getStatus(interaction.guildId, interaction.user.id);
+    }
 
     if (current.status === STATUS.WORKING) {
       return interaction.reply({ content: 'คุณกำลังเข้าเวรอยู่แล้ว', ephemeral: true });
     }
     if (current.status === STATUS.LEAVE) {
       return interaction.reply({
-        content: 'คุณอยู่ในสถานะลา ไม่สามารถเข้าเวรได้จนกว่าจะจัดการสถานะลาก่อน',
+        content: `คุณอยู่ในสถานะลาถึง ${formatThaiDateTime(current.leaveEnd)} ไม่สามารถเข้าเวรได้จนกว่าจะหมดเวลาลาหรือถอนลาก่อน`,
         ephemeral: true,
       });
     }
@@ -739,15 +908,22 @@ buttonHandlers.set(IDS.SHIFT_OUT, {
 buttonHandlers.set(IDS.LEAVE_SUBMIT_OPEN, {
   async execute(interaction) {
     if (!(await hasAllowedRole(interaction.member, interaction.guild))) {
-      return interaction.reply({ content: 'คุณไม่มีสิทธิ์ใช้งานระบบนี้', ephemeral: true });
+      return interaction.reply({ content: 'แกไม่มีสิทธิ์ใช้งานระบบนี้', ephemeral: true });
     }
 
     const modal = new ModalBuilder().setCustomId(IDS.LEAVE_MODAL).setTitle('ยื่นใบลา');
 
-    const dateInput = new TextInputBuilder()
-      .setCustomId('leave_date')
-      .setLabel('วันที่ลา')
-      .setPlaceholder('เช่น 15/09/2026 หรือ 15-17/09/2026')
+    const startInput = new TextInputBuilder()
+      .setCustomId('leave_start')
+      .setLabel('เริ่มลา (วว/ดด/ปปปป ชม:นาที)')
+      .setPlaceholder('เช่น 10/09/2027 12:00')
+      .setStyle(TextInputStyle.Short)
+      .setRequired(true);
+
+    const endInput = new TextInputBuilder()
+      .setCustomId('leave_end')
+      .setLabel('ถึง (วว/ดด/ปปปป ชม:นาที)')
+      .setPlaceholder('เช่น 11/09/2027 17:00')
       .setStyle(TextInputStyle.Short)
       .setRequired(true);
 
@@ -758,7 +934,8 @@ buttonHandlers.set(IDS.LEAVE_SUBMIT_OPEN, {
       .setRequired(true);
 
     modal.addComponents(
-      new ActionRowBuilder().addComponents(dateInput),
+      new ActionRowBuilder().addComponents(startInput),
+      new ActionRowBuilder().addComponents(endInput),
       new ActionRowBuilder().addComponents(reasonInput)
     );
 
@@ -769,7 +946,7 @@ buttonHandlers.set(IDS.LEAVE_SUBMIT_OPEN, {
 buttonHandlers.set(IDS.LEAVE_APPROVE, {
   async execute(interaction, requestId) {
     if (!isAdmin(interaction.member, interaction.guild)) {
-      return interaction.reply({ content: 'คุณไม่มีสิทธิ์ใช้งานคำสั่งนี้', ephemeral: true });
+      return interaction.reply({ content: 'แกไม่มีสิทธิ์ใช้งานคำสั่งนี้', ephemeral: true });
     }
 
     const request = await getRequest(Number(requestId));
@@ -781,7 +958,7 @@ buttonHandlers.set(IDS.LEAVE_APPROVE, {
     }
 
     await setRequestStatus(request.requestId, LEAVE_REQUEST_STATUS.APPROVED);
-    await setLeave(request.guildId, request.userId, request.date, request.reason);
+    await setLeave(request.guildId, request.userId, request.leaveStart, request.leaveEnd, request.reason);
     await refreshDashboard(interaction.client, request.guildId);
 
     const oldEmbed = interaction.message.embeds[0];
@@ -801,7 +978,7 @@ buttonHandlers.set(IDS.LEAVE_APPROVE, {
     try {
       const user = await interaction.client.users.fetch(request.userId);
       await user.send(
-        `${EMOJI.APPROVE} คำขอลาของคุณสำหรับวันที่ ${request.date} ได้รับการอนุมัติแล้ว`
+        `${EMOJI.APPROVE} คำขอลาของคุณสำหรับช่วง ${formatThaiDateTime(request.leaveStart)} — ${formatThaiDateTime(request.leaveEnd)} ได้รับการอนุมัติแล้ว`
       );
     } catch {
       // DM failed (user has DMs off, left server, etc.) — safe to ignore.
@@ -841,7 +1018,9 @@ buttonHandlers.set(IDS.LEAVE_REJECT, {
 
     try {
       const user = await interaction.client.users.fetch(request.userId);
-      await user.send(`${EMOJI.REJECT} คำขอลาของคุณสำหรับวันที่ ${request.date} ไม่ได้รับการอนุมัติ`);
+      await user.send(
+        `${EMOJI.REJECT} คำขอลาของคุณสำหรับช่วง ${formatThaiDateTime(request.leaveStart)} — ${formatThaiDateTime(request.leaveEnd)} ไม่ได้รับการอนุมัติ`
+      );
     } catch {
       // DM failed — safe to ignore.
     }
@@ -901,6 +1080,61 @@ buttonHandlers.set(IDS.SETUP_CANCEL, {
   },
 });
 
+buttonHandlers.set(IDS.SET_ROLE_ADD, {
+  async execute(interaction, token) {
+    if (!isAdmin(interaction.member, interaction.guild)) {
+      return interaction.reply({ content: 'แกไม่มีสิทธิ์ใช้งานคำสั่งนี้', ephemeral: true });
+    }
+
+    const draft = getDraft(token);
+    if (!draft) {
+      return interaction.update({ content: 'รายการนี้หมดอายุแล้ว กรุณาใช้คำสั่งอีกครั้ง', components: [] });
+    }
+
+    const settings = await getSettings(draft.guildId);
+    const merged = [...new Set([...(settings.allowedRoleIds || []), ...draft.roleIds])];
+    await updateSettings(draft.guildId, { allowedRoleIds: merged });
+    await refreshDashboard(interaction.client, draft.guildId);
+    deleteDraft(token);
+
+    const mentions = merged.map((id) => `<@&${id}>`).join(', ');
+    return interaction.update({
+      content: `เพิ่มยศเรียบร้อยแล้ว ตอนนี้ระบบอนุญาตทั้งหมด ${merged.length} ยศ: ${mentions}`,
+      components: [],
+    });
+  },
+});
+
+buttonHandlers.set(IDS.SET_ROLE_REPLACE, {
+  async execute(interaction, token) {
+    if (!isAdmin(interaction.member, interaction.guild)) {
+      return interaction.reply({ content: 'คุณไม่มีสิทธิ์ใช้งานคำสั่งนี้', ephemeral: true });
+    }
+
+    const draft = getDraft(token);
+    if (!draft) {
+      return interaction.update({ content: 'รายการนี้หมดอายุแล้ว กรุณาใช้คำสั่งอีกครั้ง', components: [] });
+    }
+
+    await updateSettings(draft.guildId, { allowedRoleIds: draft.roleIds });
+    await refreshDashboard(interaction.client, draft.guildId);
+    deleteDraft(token);
+
+    const mentions = draft.roleIds.map((id) => `<@&${id}>`).join(', ');
+    return interaction.update({
+      content: `ตั้งค่ายศสำหรับระบบใหม่ทั้งหมดเป็น: ${mentions}`,
+      components: [],
+    });
+  },
+});
+
+buttonHandlers.set(IDS.SET_ROLE_CANCEL, {
+  async execute(interaction, token) {
+    deleteDraft(token);
+    return interaction.update({ content: 'ยกเลิกแล้ว', components: [] });
+  },
+});
+
 buttonHandlers.set(IDS.ABSENCE_CONFIRM, {
   async execute(interaction, token) {
     if (!isAdmin(interaction.member, interaction.guild)) {
@@ -927,6 +1161,134 @@ buttonHandlers.set(IDS.ABSENCE_CANCEL, {
   async execute(interaction, token) {
     deleteDraft(token);
     return interaction.update({ content: 'ยกเลิกแล้ว', components: [] });
+  },
+});
+
+// ---- owner control panel buttons ----
+
+buttonHandlers.set(IDS.OWNER_MARK_ABSENT_OPEN, {
+  async execute(interaction) {
+    if (!isAdmin(interaction.member, interaction.guild)) {
+      return interaction.reply({ content: 'แกไม่มีสิทธิ์ใช้งานคำสั่งนี้', ephemeral: true });
+    }
+
+    const response = await buildAbsenceSelectResponse(interaction);
+    return interaction.reply(response);
+  },
+});
+
+buttonHandlers.set(IDS.OWNER_REVOKE_LEAVE_OPEN, {
+  async execute(interaction) {
+    if (!isAdmin(interaction.member, interaction.guild)) {
+      return interaction.reply({ content: 'แกไม่มีสิทธิ์ใช้งานคำสั่งนี้', ephemeral: true });
+    }
+
+    await sweepExpiredLeaves(interaction.guildId);
+    const onLeaveRows = (await getAllForGuild(interaction.guildId)).filter(
+      (r) => r.status === STATUS.LEAVE
+    );
+
+    if (onLeaveRows.length === 0) {
+      return interaction.reply({ content: 'ไม่มีสมาชิกที่กำลังลาอยู่ในขณะนี้', ephemeral: true });
+    }
+
+    await interaction.guild.members.fetch().catch(() => null);
+
+    const options = onLeaveRows.slice(0, 25).map((row) => {
+      const member = interaction.guild.members.cache.get(row.userId);
+      const name = member ? member.displayName : row.userId;
+      return {
+        label: `${name} (ถึง ${formatThaiDateTime(row.leaveEnd)})`.slice(0, 100),
+        value: row.userId,
+      };
+    });
+
+    const select = new StringSelectMenuBuilder()
+      .setCustomId(IDS.REVOKE_LEAVE_SELECT)
+      .setPlaceholder('เลือกสมาชิกที่ต้องการถอนลา')
+      .setMinValues(1)
+      .setMaxValues(options.length)
+      .addOptions(options);
+
+    return interaction.reply({
+      content: 'เลือกสมาชิกที่ต้องการถอนลา',
+      components: [new ActionRowBuilder().addComponents(select)],
+      ephemeral: true,
+    });
+  },
+});
+
+buttonHandlers.set(IDS.REVOKE_LEAVE_CONFIRM, {
+  async execute(interaction, token) {
+    if (!isAdmin(interaction.member, interaction.guild)) {
+      return interaction.reply({ content: 'แกไม่มีสิทธิ์ใช้งานคำสั่งนี้', ephemeral: true });
+    }
+
+    const draft = getDraft(token);
+    if (!draft) {
+      return interaction.update({ content: 'รายการนี้หมดอายุแล้ว กรุณาใช้คำสั่งอีกครั้ง', components: [] });
+    }
+
+    for (const userId of draft.userIds) {
+      await clearLeave(draft.guildId, userId);
+    }
+    await refreshDashboard(interaction.client, draft.guildId);
+    deleteDraft(token);
+
+    const mentions = draft.userIds.map((id) => `<@${id}>`).join('\n');
+    return interaction.update({ content: `ถอนลาเรียบร้อยแล้ว:\n${mentions}`, components: [] });
+  },
+});
+
+buttonHandlers.set(IDS.REVOKE_LEAVE_CANCEL, {
+  async execute(interaction, token) {
+    deleteDraft(token);
+    return interaction.update({ content: 'ยกเลิกแล้ว', components: [] });
+  },
+});
+
+// ============================================================================
+// ROLE SELECT MENU HANDLERS (Discord's role-picker component, distinct from
+// the string select menus below — used only by /set-role)
+// ============================================================================
+
+const roleSelectHandlers = new Map();
+
+roleSelectHandlers.set(IDS.SET_ROLE_SELECT, {
+  async execute(interaction) {
+    if (!isAdmin(interaction.member, interaction.guild)) {
+      return interaction.reply({ content: 'แกไม่มีสิทธิ์ใช้งานคำสั่งนี้', ephemeral: true });
+    }
+
+    const roleIds = interaction.values; // up to 25, guaranteed by setMaxValues(25)
+    const token = createDraft({ guildId: interaction.guildId, roleIds });
+    const mentions = roleIds.map((id) => `<@&${id}>`).join(', ');
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`${IDS.SET_ROLE_ADD}:${token}`)
+        .setLabel('เพิ่มเข้ารายการเดิม')
+        .setEmoji('➕')
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`${IDS.SET_ROLE_REPLACE}:${token}`)
+        .setLabel('แทนที่รายการเดิมทั้งหมด')
+        .setEmoji('🔁')
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId(`${IDS.SET_ROLE_CANCEL}:${token}`)
+        .setLabel('ยกเลิก')
+        .setEmoji('❌')
+        .setStyle(ButtonStyle.Danger)
+    );
+
+    return interaction.update({
+      content:
+        `เลือกยศ: ${mentions}\n\n` +
+        'ต้องการ "เพิ่มเข้ารายการเดิม"' +
+        'หรือ "แทนที่รายการเดิมทั้งหมด"?',
+      components: [row],
+    });
   },
 });
 
@@ -967,6 +1329,37 @@ selectMenuHandlers.set(IDS.ABSENCE_SELECT, {
   },
 });
 
+selectMenuHandlers.set(IDS.REVOKE_LEAVE_SELECT, {
+  async execute(interaction) {
+    if (!isAdmin(interaction.member, interaction.guild)) {
+      return interaction.reply({ content: 'แกไม่มีสิทธิ์ใช้งานคำสั่งนี้', ephemeral: true });
+    }
+
+    const userIds = interaction.values;
+    const token = createDraft({ guildId: interaction.guildId, userIds });
+
+    const mentions = userIds.map((id) => `<@${id}>`).join('\n');
+
+    const row = new ActionRowBuilder().addComponents(
+      new ButtonBuilder()
+        .setCustomId(`${IDS.REVOKE_LEAVE_CONFIRM}:${token}`)
+        .setLabel('Confirm')
+        .setEmoji('✅')
+        .setStyle(ButtonStyle.Success),
+      new ButtonBuilder()
+        .setCustomId(`${IDS.REVOKE_LEAVE_CANCEL}:${token}`)
+        .setLabel('Cancel')
+        .setEmoji('❌')
+        .setStyle(ButtonStyle.Danger)
+    );
+
+    return interaction.update({
+      content: `ยืนยันถอนลาสมาชิกต่อไปนี้:\n${mentions}`,
+      components: [row],
+    });
+  },
+});
+
 // ============================================================================
 // MODAL HANDLERS
 // ============================================================================
@@ -975,8 +1368,25 @@ const modalHandlers = new Map();
 
 modalHandlers.set(IDS.LEAVE_MODAL, {
   async execute(interaction) {
-    const date = interaction.fields.getTextInputValue('leave_date');
+    const startText = interaction.fields.getTextInputValue('leave_start');
+    const endText = interaction.fields.getTextInputValue('leave_end');
     const reason = interaction.fields.getTextInputValue('leave_reason');
+
+    const leaveStart = parseThaiDateTime(startText);
+    const leaveEnd = parseThaiDateTime(endText);
+
+    if (!leaveStart || !leaveEnd) {
+      return interaction.reply({
+        content: 'รูปแบบวันที่ไม่ถูกต้อง กรุณาใช้รูปแบบ วว/ดด/ปปปป ชม:นาที เช่น 10/09/2027 12:00',
+        ephemeral: true,
+      });
+    }
+    if (leaveEnd <= leaveStart) {
+      return interaction.reply({
+        content: 'วันที่/เวลาสิ้นสุดต้องอยู่หลังวันที่/เวลาเริ่มลา',
+        ephemeral: true,
+      });
+    }
 
     const settings = await getSettings(interaction.guildId);
     if (!settings.leaveChannelId) {
@@ -994,14 +1404,20 @@ modalHandlers.set(IDS.LEAVE_MODAL, {
       });
     }
 
-    const requestId = await createRequest(interaction.guildId, interaction.user.id, date, reason);
+    const requestId = await createRequest(
+      interaction.guildId,
+      interaction.user.id,
+      leaveStart,
+      leaveEnd,
+      reason
+    );
 
     const embed = new EmbedBuilder()
       .setColor(DEFAULT_EMBED_COLOR)
       .setTitle('คำขอลา')
       .addFields(
         { name: 'ผู้ขอลา', value: `<@${interaction.user.id}>` },
-        { name: 'วันที่ลา', value: date },
+        { name: 'ช่วงเวลาลา', value: `${formatThaiDateTime(leaveStart)} — ${formatThaiDateTime(leaveEnd)}` },
         { name: 'เหตุผล', value: reason },
         { name: 'สถานะ', value: 'รออนุมัติ' }
       )
@@ -1070,6 +1486,13 @@ client.on('interactionCreate', async (interaction) => {
       return await handler.execute(interaction, ...rest);
     }
 
+    if (interaction.isRoleSelectMenu()) {
+      const [prefix, ...rest] = interaction.customId.split(':');
+      const handler = roleSelectHandlers.get(prefix);
+      if (!handler) return;
+      return await handler.execute(interaction, ...rest);
+    }
+
     if (interaction.isStringSelectMenu()) {
       const [prefix, ...rest] = interaction.customId.split(':');
       const handler = selectMenuHandlers.get(prefix);
@@ -1108,6 +1531,19 @@ client.once('ready', async () => {
       console.error(`[ready] failed to refresh dashboard for guild ${guild.id}:`, err.message);
     }
   }
+
+  // Leave periods expire on the clock, not on user action — sweep every
+  // guild periodically so a dashboard update (and the ability to shift in)
+  // doesn't have to wait for someone to press a button.
+  setInterval(async () => {
+    for (const guild of client.guilds.cache.values()) {
+      try {
+        await refreshDashboard(client, guild.id); // includes sweepExpiredLeaves()
+      } catch (err) {
+        console.error(`[leave-sweep] failed for guild ${guild.id}:`, err.message);
+      }
+    }
+  }, 60 * 1000).unref();
 });
 
 // Catch anything that slips past per-interaction error handling so the
@@ -1142,27 +1578,6 @@ async function registerCommands() {
     console.error('❌ Failed to register slash commands:', error);
   }
 }
-
-// ============================================================================
-// HTTP SERVER — only needed if this is deployed as a Render "Web Service"
-// (a "Background Worker" doesn't need this at all). Render's free Web
-// Service requires the app to bind to process.env.PORT within its first
-// scan, otherwise the deploy is marked failed with "no open ports
-// detected". This also gives you a URL you can ping with an uptime
-// monitor to keep a free Web Service from spinning down.
-// ============================================================================
-
-const http = require('http');
-const PORT = process.env.PORT || 3000;
-
-http
-  .createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('Shift bot is running.');
-  })
-  .listen(PORT, () => {
-    console.log(`[http] Listening on port ${PORT}`);
-  });
 
 // ============================================================================
 // START
